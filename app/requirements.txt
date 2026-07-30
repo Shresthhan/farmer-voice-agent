@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+ollama
+faster-whisper
+psycopg2-binary
+python-multipart
+requests
