@@ -1,10 +1,15 @@
-"""Speech-to-text helpers."""
+from faster_whisper import WhisperModel
+import tempfile
 
-from __future__ import annotations
+# "base" model is a good speed/accuracy balance for a demo
+# loads once when the app starts, not on every request
+model = WhisperModel("base", device="cpu", compute_type="int8")
 
-from pathlib import Path
-
-
-def transcribe_audio(audio_path: str | Path) -> str:
-    path = Path(audio_path)
-    return f"transcription placeholder for {path.name}"
+def transcribe_audio(audio_bytes: bytes) -> str:
+    # faster-whisper needs a file path, so we write the bytes to a temp file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        segments, _ = model.transcribe(tmp.name)
+        text = " ".join(segment.text for segment in segments)
+    return text.strip()

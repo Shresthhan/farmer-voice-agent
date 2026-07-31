@@ -1,11 +1,12 @@
-"""Text-to-speech helpers."""
+import requests
+import os
 
-from __future__ import annotations
+PIPER_HOST = os.getenv("PIPER_HOST", "http://piper:10200")
 
-from pathlib import Path
-
-
-def synthesize_speech(text: str, output_path: str | Path) -> Path:
-    path = Path(output_path)
-    path.write_text(text, encoding="utf-8")
-    return path
+def synthesize_speech(text: str) -> bytes:
+    response = requests.post(
+        f"{PIPER_HOST}/api/tts",
+        json={"text": text}
+    )
+    response.raise_for_status()
+    return response.content   # raw audio bytes (wav format)
