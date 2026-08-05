@@ -1,12 +1,18 @@
-import requests
 import os
+import tempfile
+import edge_tts
 
-PIPER_HOST = os.getenv("PIPER_HOST", "http://piper:10200")
+VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-JennyNeural")
 
-def synthesize_speech(text: str) -> bytes:
-    response = requests.post(
-        f"{PIPER_HOST}/api/tts",
-        json={"text": text}
-    )
-    response.raise_for_status()
-    return response.content   # raw audio bytes (wav format)
+async def synthesize_speech(text: str) -> bytes:
+    communicate = edge_tts.Communicate(text=text, voice=VOICE)
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        path = tmp.name
+
+    try:
+        await communicate.save(path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
