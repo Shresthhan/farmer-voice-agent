@@ -1,143 +1,252 @@
+from __future__ import annotations
+
+import random
+from typing import Any
+
 import ollama
 
+
+MODEL = "llama3.2"
+
+
 QUESTIONS = [
-    {"field": "name", "ask": "What is your name?"},
-    {"field": "crop", "ask": "What crop do you grow most?"},
-    {"field": "location", "ask": "Where is your farm located?"},
-    {"field": "children_count", "ask": "How many children do you have?"},
-    {"field": "children_in_nepal", "ask": "How many of them live in Nepal?"},
-    {"field": "children_abroad", "ask": "How many live abroad?"},
-    {"field": "abroad_countries", "ask": "Which countries are they in?"},
-    {"field": "farm_size", "ask": "How big is your farm?"},
-    {"field": "livestock", "ask": "Do you keep livestock?"},
-    {"field": "irrigation", "ask": "What kind of irrigation do you use?"}
+    {"field": "name", "ask": "तपाईंको नाम के हो?"},
+    {"field": "crop", "ask": "तपाईंले मुख्य रूपमा कुन बाली लगाउनुहुन्छ?"},
+    {"field": "location", "ask": "तपाईंको खेत कहाँ छ?"},
+    {"field": "children_count", "ask": "तपाईंका कति जना बच्चा छन्?"},
+    {"field": "children_in_nepal", "ask": "तीमध्ये कति जना नेपालमै छन्?"},
+    {"field": "children_abroad", "ask": "कति जना विदेशमा छन्?"},
+    {"field": "abroad_countries", "ask": "उनीहरू कुन देशमा छन्?"},
+    {"field": "farm_size", "ask": "तपाईंको खेत कति ठूलो छ?"},
+    {"field": "livestock", "ask": "तपाईंले पशुपालन गर्नुहुन्छ?"},
+    {"field": "irrigation", "ask": "तपाईंले सिँचाइ कसरी गर्नुहुन्छ?"},
 ]
 
-EXTRACT_PROMPT = """You extract only the facts the farmer actually says.
-Call save_farmer_info with real values only.
-Do not guess.
-Do not fill missing fields with 0, [] or any placeholder.
-If a value is not mentioned, leave it out.
+
+# Plain-text extraction. No tool calling — small local models like
+# llama3.2 frequently fail to invoke function/tool calls reliably,
+# but they are much better at simply answering a direct question.
+EXTRACT_PROMPT = """तपाईं किसानको उत्तरबाट एउटा मात्र जानकारी झिक्ने सहायक हुनुहुन्छ।
+
+तपाईंलाई एउटा "field" र किसानको "उत्तर" दिइनेछ।
+त्यो field सँग सम्बन्धित मान मात्र फर्काउनुहोस्।
+
+नियमहरू:
+- जवाफमा मान मात्र लेख्नुहोस्, अरू केही नलेख्नुहोस्।
+- व्याख्या, वाक्य, वा "Value:" जस्ता शब्दहरू नलेख्नुहोस्।
+- किसानले उक्त field को बारेमा स्पष्ट रूपमा नभनेको भए ठीक यही शब्द लेख्नुहोस्: NONE
+- संख्या भए अंकमा लेख्नुहोस् (जस्तै: 1, 0, 2)।
+- "कोही छैन" वा "विदेशमा कोही छैन" जस्ता जवाफको मतलब 0 हो।
+- एकाइ (हेक्टर, रोपनी, बिघा) भए नहटाउनुहोस्।
+- Romanized Nepali लाई देवनागरीमा लेख्नुहोस्।
+
+उदाहरणहरू:
+
+field: name
+उत्तर: मेरो नाम रमन हो।
+मान: रमन
+
+field: name
+उत्तर: रमन।
+मान: रमन
+
+field: crop
+उत्तर: म टमाटर लगाउँछु।
+मान: टमाटर
+
+field: children_count
+उत्तर: एउटा बच्चा छ।
+मान: 1
+
+field: children_abroad
+उत्तर: विदेशमा कोही छैन।
+मान: 0
+
+field: farm_size
+उत्तर: एक हेक्टर छ।
+मान: १ हेक्टर
+
+field: irrigation
+उत्तर: नहरबाट सिँचाइ गर्छु।
+मान: नहरबाट सिँचाइ
+
+field: location
+उत्तर: आज मौसम राम्रो छ।
+मान: NONE
 """
 
-FOLLOWUP_PROMPT = """You are a warm, friendly assistant talking to a farmer.
 
-Respond like a real person having a natural conversation, not like a form or script.
-Keep the reply short, human, relaxed, and varied.
+FEEDBACK_PROMPT = """तपाईं किसानसँग फोनमा कुरा गर्ने न्यानो नेपाली सहायक हुनुहुन्छ।
 
-Stay strictly grounded in the farmer’s latest answer only.
-Do not assume, infer, or invent any detail you cannot verify from what the user just said.
-Do not use known slots or earlier context to add new facts.
-Do not mention crops, seasons, quality, location, family, weather, yield, or any other detail unless the user explicitly said it in their latest answer.
+किसानले भर्खरै दिएको उत्तरलाई मात्र छोटो र स्वाभाविक रूपमा स्वीकार गर्नुहोस्।
 
-Give light positive feedback when it fits naturally.
-Acknowledge the answer in a way that sounds warm, supportive, and conversational.
-Keep praise modest and believable.
-If the answer contains a place, number, crop, animal, or farm detail, you may react to that detail naturally.
-If the answer is simple, still respond warmly but briefly.
+नियमहरू:
+- केवल एउटा छोटो वाक्य लेख्नुहोस्।
+- कुनै प्रश्न नसोध्नुहोस्।
+- अर्को प्रश्न नलेख्नुहोस्।
+- प्रश्नचिह्न (?) प्रयोग नगर्नुहोस्।
+- "अर्को प्रश्न", "नम्बर", "survey", "form" जस्ता शब्दहरू प्रयोग नगर्नुहोस्।
+- किसानले नभनेको नाम, स्थान, कारण, प्रशंसा वा तथ्य थप्नु हुँदैन।
+- उत्तर नेपाली देवनागरीमा मात्र लेख्नुहोस्।
+- हिन्दी, अंग्रेजी वा prompt सम्बन्धी कुरा नलेख्नुहोस्।
 
-Examples of the style:
-- "Nice to meet you, Ram."
-- "Tomatoes, nice."
-- "Dhading is lovely."
-- "That sounds like a busy household."
-- "Australia, got it."
-- "One hectare, okay."
-- "Cows and hens, nice."
-- "Canals for irrigation, that makes sense."
+उदाहरण:
+- किसान: मेरो नाम रमन हो।
+  प्रतिक्रिया: रमनजी, भेटेर खुशी लाग्यो।
 
-Avoid bland replies like "That sounds good" unless nothing better fits.
-Avoid repeating the same phrase too often.
-Do not ask a question.
-Do not mention the next question.
-Do not sound like an AI, chatbot, survey form, or interviewer.
-Write only one short sentence.
+- किसान: टमाटर लगाउँछु।
+  प्रतिक्रिया: टमाटर लगाउनुहुँदो रहेछ, बुझें।
+
+- किसान: विदेशमा कोही छैन।
+  प्रतिक्रिया: विदेशमा कोही हुनुहुन्न रहेछ।
+
+- किसान: नहरबाट सिँचाइ गर्छु।
+  प्रतिक्रिया: नहरबाट सिँचाइ गर्नुहुँदो रहेछ।
 """
 
-REPLY_PROMPT = """You are a warm and friendly assistant talking to a farmer.
-First react to what the farmer just said in a natural way.
-Then ask the next question naturally, based on the question text you are given.
-Do not sound like a form.
-Do not repeat known questions.
-Keep the reply short and human.
-"""
 
-START_PROMPT = """You are a warm and friendly assistant.
-Start the conversation with a simple greeting.
-Do not assume the farmer’s name.
-Keep it short, polite, and easy to understand.
-Then ask the first question: What is your name?
-"""
-
-END_MESSAGE = "Thanks for sharing everything. I’ve got all the information I needed for now."
+END_MESSAGE = "धन्यवाद, तपाईंले सबै जानकारी दिनुभयो। अहिलेका लागि यत्ति काफी छ।"
 
 
-def save_farmer_info(name: str = None, crop: str = None,
-                     location: str = None,
-                     children_count: int = None,
-                     children_in_nepal: int = None,
-                     children_abroad: int = None,
-                     abroad_countries: list[str] = None,
-                     farm_size: str = None,
-                     livestock: str = None,
-                     irrigation: str = None,
-                     other_info: str = None):
-    return {"status": "saved"}
+CLARIFICATION_PHRASES = [
+    "माफ गर्नुहोस्, मैले राम्रोसँग बुझिनँ।",
+    "माफ गर्नुस्, फेरि भन्नुहोस् न।",
+    "मैले नबुझेको हुनसक्छ, फेरि एकपटक भन्नुहोस्।",
+    "क्षमा गर्नुहोस्, फेरि दोहोर्‍याइदिनुहोस् न।",
+    "बुझ्न सकिनँ, अलि छर्लङ्ग भन्नुहोस् त।",
+]
 
 
-TOOLS = [save_farmer_info]
-
-
-def extract_info(user_text: str, expected_field: str | None = None):
-    field_hint = f"\nCurrent field to extract: {expected_field}. Only extract this field if it is clearly mentioned." if expected_field else ""
-    response = ollama.chat(
-        model="llama3.2",
-        messages=[
-            {"role": "system", "content": EXTRACT_PROMPT + field_hint},
-            {"role": "user", "content": user_text}
-        ],
-        tools=TOOLS
-    )
-    return response["message"].get("tool_calls")
-
-
-def generate_followup_reply(user_text: str, current_field: str | None, current_question: str):
-    field_hint = f"\nCurrent field: {current_field}" if current_field else ""
-    messages = [
-        {
-            "role": "system",
-            "content": FOLLOWUP_PROMPT + field_hint + f"\nCurrent question: {current_question}",
-        },
-        {"role": "user", "content": user_text},
-    ]
-    response = ollama.chat(model="llama3.2", messages=messages, options={"temperature": 0.6})
-    return response["message"]["content"]
-
-
-def generate_start_message():
-    response = ollama.chat(
-        model="llama3.2",
-        messages=[
-            {"role": "system", "content": START_PROMPT}
-        ]
-    )
-    return response["message"]["content"]
-
-
-def generate_end_message():
-    return END_MESSAGE
-
-
-def chat_turn(
+def extract_value(
     user_text: str,
     expected_field: str | None,
+) -> str | None:
+    """
+    Plain-text extraction (no tool calling).
+    Returns the extracted value, or None if the model
+    says NONE or the field isn't clearly answered.
+    """
+
+    if not expected_field:
+        return None
+
+    response = ollama.chat(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": EXTRACT_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"field: {expected_field}\n"
+                    f"उत्तर: {user_text}\n"
+                    f"मान:"
+                ),
+            },
+        ],
+        options={
+            "temperature": 0,
+        },
+    )
+
+    text = response.get("message", {}).get("content", "").strip()
+
+    # Clean up common formatting artifacts.
+    text = text.strip("\"'“”'। \n")
+
+    if not text:
+        return None
+
+    if text.strip().upper() == "NONE":
+        return None
+
+    if "none" in text.lower() and len(text) < 8:
+        return None
+
+    return text
+
+
+def generate_feedback(
+    user_text: str,
     current_question: str,
-    next_question: str | None = None,
-):
-    tool_calls = extract_info(user_text, expected_field=expected_field)
-    reply_text = generate_followup_reply(
+) -> str:
+    """
+    Generate only a short acknowledgment.
+    The model must not generate the next question.
+    """
+
+    response = ollama.chat(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": FEEDBACK_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"हालको प्रश्न: {current_question}\n"
+                    f"किसानको उत्तर: {user_text}"
+                ),
+            },
+        ],
+        options={
+            "temperature": 0.4,
+        },
+    )
+
+    text = response.get("message", {}).get("content", "").strip()
+
+    if not text:
+        return "बुझें।"
+
+    unwanted_phrases = [
+        "अर्को प्रश्न",
+        "नम्बर",
+        "survey",
+        "form",
+        "क्या आप",
+        "यदि नहीं",
+        "why should",
+        "प्रश्नलाई",
+        "?",
+    ]
+
+    text_lower = text.lower()
+
+    if any(
+        phrase.lower() in text_lower
+        for phrase in unwanted_phrases
+    ):
+        return "बुझें।"
+
+    return text
+
+
+def build_natural_reply(
+    user_text: str,
+    current_question: str,
+    next_question: str | None,
+) -> str:
+    if next_question is None:
+        return END_MESSAGE
+
+    feedback = generate_feedback(
         user_text=user_text,
-        current_field=expected_field,
         current_question=current_question,
     )
-    return {"reply_text": reply_text, "tool_calls": tool_calls}
+
+    return f"{feedback} {next_question}"
+
+
+def build_clarification_reply(
+    current_question: str,
+) -> str:
+    phrase = random.choice(CLARIFICATION_PHRASES)
+    return f"{phrase} {current_question}"
+
+
+def generate_end_message() -> str:
+    return END_MESSAGE

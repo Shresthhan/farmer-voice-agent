@@ -1,165 +1,300 @@
+from __future__ import annotations
+
+import base64
+from typing import Any
+
 from fastapi import FastAPI, File, UploadFile
-from db import init_db, get_session, save_session
-from llm_agent import QUESTIONS, chat_turn, generate_end_message
+
+from db import get_session, init_db, save_session
+from llm_agent import (
+    QUESTIONS,
+    build_clarification_reply,
+    build_natural_reply,
+    extract_value,
+    generate_end_message,
+)
+from models import TextMessage
 from stt import transcribe_audio
 from tts import synthesize_speech
-from models import TextMessage
-import base64
-import json
+
 
 app = FastAPI()
+
 init_db()
 
 
-def clean_value(v):
-    if v is None:
+def is_zero_like(value: Any) -> bool:
+    if isinstance(value, bool):
         return False
-    if isinstance(v, str) and v.strip() == "":
-        return False
-    if isinstance(v, str) and v.strip().lower() in {"none", "null", "[]", "none mentioned"}:
-        return False
-    return True
+
+    if isinstance(value, (int, float)):
+        return value == 0
+
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "0",
+            "०",
+            "zero",
+            "शून्य",
+        }
+
+    return False
 
 
-def merge_slots(slots: dict, args: dict):
-    for k, v in args.items():
-        if not clean_value(v):
+def get_next_question(
+    slots: dict[str, Any],
+    start_index: int,
+) -> tuple[dict[str, str] | None, int]:
+    """
+    Return the next unanswered question.
+
+    abroad_countries is skipped when children_abroad is zero.
+    """
+
+    for index in range(
+        max(0, start_index),
+        len(QUESTIONS),
+    ):
+        item = QUESTIONS[index]
+        field = item["field"]
+
+        if (
+            field == "abroad_countries"
+            and is_zero_like(
+                slots.get("children_abroad")
+            )
+        ):
             continue
 
-        if k in slots and k not in {"abroad_countries", "other_info"}:
-            continue
+        if field not in slots:
+            return item, index
 
-        if k == "abroad_countries":
-            if isinstance(v, str):
-                try:
-                    v = json.loads(v)
-                except:
-                    v = [v]
-            if not isinstance(v, list):
-                v = [v]
-            current = slots.get("abroad_countries", [])
-            merged = current + v
-            slots["abroad_countries"] = list(dict.fromkeys(merged))
-
-        elif k == "other_info":
-            slots.setdefault("other_info", []).append(v)
-
-        else:
-            slots[k] = v
-
-    return slots
-
-
-def get_next_question(slots: dict, current_index: int):
-    for i in range(current_index, len(QUESTIONS)):
-        item = QUESTIONS[i]
-        if item["field"] not in slots:
-            return item, i
     return None, len(QUESTIONS)
 
 
-def process_turn(session_id: str, user_text: str):
-    slots, history, current_topic_index = get_session(session_id)
-    current_item = QUESTIONS[current_topic_index] if current_topic_index < len(QUESTIONS) else None
-
-    expected_field = current_item["field"] if current_item else None
-
-    response = chat_turn(
-        user_text=user_text,
-        expected_field=expected_field,
-        current_question=current_item["ask"] if current_item else "",
+def process_turn(
+    session_id: str,
+    user_text: str,
+) -> dict[str, Any]:
+    slots, history, current_index = get_session(
+        session_id
     )
 
-    tool_calls = response["tool_calls"]
-    if tool_calls:
-        for call in tool_calls:
-            arguments = call["function"]["arguments"]
-            if expected_field and expected_field in arguments:
-                slots = merge_slots(slots, {expected_field: arguments[expected_field]})
+    current_item, _ = get_next_question(
+        slots,
+        current_index,
+    )
 
-    asked_item, current_topic_index = get_next_question(slots, current_topic_index)
-    upcoming_item = QUESTIONS[current_topic_index + 1] if current_topic_index + 1 < len(QUESTIONS) else None
+    if current_item is None:
+        return {
+            "reply_text": generate_end_message(),
+            "collected_data": slots,
+            "current_topic_index": len(QUESTIONS),
+            "current_question": None,
+            "next_question": None,
+        }
 
-    reply_text = response["reply_text"]
-    if asked_item:
-        reply_text = f"{reply_text} {asked_item['ask']}"
+    expected_field = current_item["field"]
+
+    value = extract_value(
+        user_text=user_text,
+        expected_field=expected_field,
+    )
+
+    field_was_saved = False
+
+    if value is not None:
+        slots[expected_field] = value
+        field_was_saved = True
+
+        if expected_field == "children_abroad" and is_zero_like(value):
+            slots["children_abroad"] = "0"
+            slots["abroad_countries"] = []
+
+    next_item, next_index = get_next_question(
+        slots,
+        current_index,
+    )
+
+    if not field_was_saved:
+        reply_text = build_clarification_reply(
+            current_question=current_item["ask"],
+        )
+    elif next_item is None:
+        reply_text = generate_end_message()
     else:
-        reply_text = f"{reply_text} {generate_end_message()}"
+        reply_text = build_natural_reply(
+            user_text=user_text,
+            current_question=current_item["ask"],
+            next_question=next_item["ask"],
+        )
 
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": reply_text})
+    history = list(history or [])
 
-    save_session(session_id, slots, history, current_topic_index)
+    history.append(
+        {
+            "role": "user",
+            "content": user_text,
+        }
+    )
+
+    history.append(
+        {
+            "role": "assistant",
+            "content": reply_text,
+        }
+    )
+
+    save_session(
+        session_id=session_id,
+        slots=slots,
+        history=history,
+        current_topic_index=next_index,
+    )
+
+    following_item, _ = get_next_question(
+        slots,
+        next_index,
+    )
 
     return {
         "reply_text": reply_text,
         "collected_data": slots,
-        "current_topic_index": current_topic_index,
-        "next_question": upcoming_item["ask"] if upcoming_item else None,
-        "current_question": asked_item["ask"] if asked_item else None,
+        "current_topic_index": next_index,
+        "current_question": (
+            next_item["ask"]
+            if next_item
+            else None
+        ),
+        "next_question": (
+            following_item["ask"]
+            if following_item
+            else None
+        ),
     }
 
 
 @app.get("/")
-def health():
-    return {"status": "running"}
+def health() -> dict[str, str]:
+    return {
+        "status": "running",
+    }
 
 
 @app.get("/start/{session_id}")
-def start_conversation(session_id: str):
-    slots, history, current_topic_index = get_session(session_id)
+def start_conversation(
+    session_id: str,
+) -> dict[str, Any]:
+    slots, history, current_index = get_session(
+        session_id
+    )
+
+    item, index = get_next_question(
+        slots,
+        current_index,
+    )
+
+    if item is None:
+        return {
+            "reply_text": generate_end_message(),
+            "current_topic_index": index,
+            "next_question": None,
+        }
+
     if history:
-        next_item, _ = get_next_question(slots, current_topic_index)
-        if next_item:
-            return {"reply_text": f"Namaste! Let’s continue. {next_item['ask']}"}
-        return {"reply_text": "Namaste! We have already completed the questions."}
-
-    first_question = QUESTIONS[0]["ask"] if QUESTIONS else "What is your name?"
-    return {"reply_text": f"Namaste! I’ll ask you a few quick questions about your farm. {first_question}"}
-
-
-@app.post("/talk/{session_id}")
-async def talk(session_id: str, audio: UploadFile = File(...)):
-    audio_bytes = await audio.read()
-    user_text = transcribe_audio(audio_bytes)
-    result = process_turn(session_id, user_text)
-    reply_text = result["reply_text"]
-
-    audio_reply = await synthesize_speech(reply_text)
-    audio_reply_b64 = base64.b64encode(audio_reply).decode("utf-8")
+        greeting = "नमस्ते, अघि बढौँ।"
+    else:
+        greeting = (
+            "नमस्ते! तपाईंको खेतबारीबारे "
+            "थोरै कुरा गरौँ।"
+        )
 
     return {
-        "reply_text": reply_text,
-        "audio_reply_b64": audio_reply_b64,
-        "user_text": user_text,
-        **result,
+        "reply_text": f"{greeting} {item['ask']}",
+        "current_topic_index": index,
+        "next_question": item["ask"],
+        "collected_data": slots,
     }
 
 
 @app.post("/talk_text/{session_id}")
-def talk_text(session_id: str, payload: TextMessage):
-    return process_turn(session_id, payload.text)
+def talk_text(
+    session_id: str,
+    payload: TextMessage,
+) -> dict[str, Any]:
+    return process_turn(
+        session_id=session_id,
+        user_text=payload.text,
+    )
+
+
+@app.post("/talk/{session_id}")
+async def talk(
+    session_id: str,
+    audio: UploadFile = File(...),
+) -> dict[str, Any]:
+    audio_bytes = await audio.read()
+
+    user_text = transcribe_audio(audio_bytes)
+
+    result = process_turn(
+        session_id=session_id,
+        user_text=user_text,
+    )
+
+    audio_reply = await synthesize_speech(
+        result["reply_text"]
+    )
+
+    return {
+        **result,
+        "user_text": user_text,
+        "audio_reply_b64": base64.b64encode(
+            audio_reply
+        ).decode("utf-8"),
+    }
+
+
+@app.post("/talk_voice_text/{session_id}")
+async def talk_voice_text(
+    session_id: str,
+    audio: UploadFile = File(...),
+) -> dict[str, Any]:
+    audio_bytes = await audio.read()
+
+    user_text = transcribe_audio(audio_bytes)
+
+    result = process_turn(
+        session_id=session_id,
+        user_text=user_text,
+    )
+
+    return {
+        **result,
+        "user_text": user_text,
+    }
 
 
 @app.get("/sessions/{session_id}")
-def view_session(session_id: str):
-    slots, history, current_topic_index = get_session(session_id)
-    next_item, _ = get_next_question(slots, current_topic_index)
+def view_session(
+    session_id: str,
+) -> dict[str, Any]:
+    slots, history, current_index = get_session(
+        session_id
+    )
+
+    item, index = get_next_question(
+        slots,
+        current_index,
+    )
+
     return {
         "collected_data": slots,
         "conversation": history,
-        "current_topic_index": current_topic_index,
-        "next_question": next_item["ask"] if next_item else None
-    }
-
-@app.post("/talk_voice_text/{session_id}")
-async def talk_voice_text(session_id: str, audio: UploadFile = File(...)):
-    audio_bytes = await audio.read()
-    user_text = transcribe_audio(audio_bytes)
-    result = process_turn(session_id, user_text)
-
-    return {
-        "reply_text": result["reply_text"],
-        "user_text": user_text,
-        **result,
+        "current_topic_index": index,
+        "next_question": (
+            item["ask"]
+            if item
+            else None
+        ),
     }
